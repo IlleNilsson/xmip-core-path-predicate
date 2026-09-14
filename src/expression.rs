@@ -3,9 +3,13 @@
 //! Precedence is the usual one: `not` binds tightest, then `and`, then `or`,
 //! and parentheses override. So `a or b and c` is `a or (b and c)`, as in
 //! every language a route author will have written before this one.
+//!
+//! The cursor the parser walks its tokens with is the capability's, shared
+//! with `FHIRPath` (ADR-0044); the grammar below is the predicate's.
 
 use crate::lexer::{Token, error, tokenize};
 use contract::{ContractError, StructuredValue};
+use path::cursor::Cursor;
 
 /// One side of a comparison.
 #[derive(Clone, Debug, PartialEq)]
@@ -77,159 +81,134 @@ impl Expression {
     /// `and`, `or`, `not` and parentheses.
     pub fn parse(text: &str) -> Result<Self, ContractError> {
         let tokens = tokenize(text)?;
-        let mut parser = Parser {
-            tokens: &tokens,
-            at: 0,
-        };
-        let expression = parser.disjunction()?;
-        match parser.tokens.get(parser.at) {
-            None => Ok(expression),
+        let mut cursor = Cursor::new("predicate", &tokens);
+        let parsed = disjunction(&mut cursor)?;
+        match cursor.peek() {
+            None => Ok(parsed),
             Some(token) => Err(error(format!("unexpected {token:?} after the predicate"))),
         }
     }
 }
 
-struct Parser<'a> {
-    tokens: &'a [Token],
-    at: usize,
+type Tokens<'a> = Cursor<'a, Token>;
+
+fn disjunction(cursor: &mut Tokens<'_>) -> Result<Expression, ContractError> {
+    let mut left = conjunction(cursor)?;
+    while word_is(cursor, "or") {
+        cursor.advance(1);
+        let right = conjunction(cursor)?;
+        left = Expression::Or(Box::new(left), Box::new(right));
+    }
+    Ok(left)
 }
 
-impl Parser<'_> {
-    fn disjunction(&mut self) -> Result<Expression, ContractError> {
-        let mut left = self.conjunction()?;
-        while self.word_is("or") {
-            self.at += 1;
-            let right = self.conjunction()?;
-            left = Expression::Or(Box::new(left), Box::new(right));
+fn conjunction(cursor: &mut Tokens<'_>) -> Result<Expression, ContractError> {
+    let mut left = negation(cursor)?;
+    while word_is(cursor, "and") {
+        cursor.advance(1);
+        let right = negation(cursor)?;
+        left = Expression::And(Box::new(left), Box::new(right));
+    }
+    Ok(left)
+}
+
+fn negation(cursor: &mut Tokens<'_>) -> Result<Expression, ContractError> {
+    if word_is(cursor, "not") {
+        cursor.advance(1);
+        return Ok(Expression::Not(Box::new(negation(cursor)?)));
+    }
+    primary(cursor)
+}
+
+fn primary(cursor: &mut Tokens<'_>) -> Result<Expression, ContractError> {
+    match cursor.peek() {
+        Some(Token::OpenParen) => {
+            cursor.advance(1);
+            let inner = disjunction(cursor)?;
+            cursor.expect(&Token::CloseParen)?;
+            Ok(inner)
         }
-        Ok(left)
-    }
-
-    fn conjunction(&mut self) -> Result<Expression, ContractError> {
-        let mut left = self.negation()?;
-        while self.word_is("and") {
-            self.at += 1;
-            let right = self.negation()?;
-            left = Expression::And(Box::new(left), Box::new(right));
+        Some(Token::Word(name)) if cursor.peek_at(1) == Some(&Token::OpenParen) => {
+            let name = name.clone();
+            cursor.advance(2);
+            let called = call(cursor, &name)?;
+            cursor.expect(&Token::CloseParen)?;
+            Ok(called)
         }
-        Ok(left)
+        _ => comparison(cursor),
     }
+}
 
-    fn negation(&mut self) -> Result<Expression, ContractError> {
-        if self.word_is("not") {
-            self.at += 1;
-            return Ok(Expression::Not(Box::new(self.negation()?)));
+fn call(cursor: &mut Tokens<'_>, name: &str) -> Result<Expression, ContractError> {
+    match name {
+        "exists" => Ok(Expression::Exists(path(cursor)?)),
+        "starts-with" | "contains" => {
+            let path = path(cursor)?;
+            cursor.expect(&Token::Comma)?;
+            let text = match cursor.take() {
+                Some(Token::Text(text)) => text.clone(),
+                other => {
+                    return Err(error(format!("{name}() needs a \"text\", found {other:?}")));
+                }
+            };
+            Ok(if name == "contains" {
+                Expression::Contains { path, text }
+            } else {
+                Expression::StartsWith { path, text }
+            })
         }
-        self.primary()
+        other => Err(error(format!(
+            "{other}() is not a function a predicate has"
+        ))),
     }
+}
 
-    fn primary(&mut self) -> Result<Expression, ContractError> {
-        match self.peek() {
-            Some(Token::OpenParen) => {
-                self.at += 1;
-                let inner = self.disjunction()?;
-                self.expect(&Token::CloseParen)?;
-                Ok(inner)
-            }
-            Some(Token::Word(name)) if self.tokens.get(self.at + 1) == Some(&Token::OpenParen) => {
-                let name = name.clone();
-                self.at += 2;
-                let call = self.call(&name)?;
-                self.expect(&Token::CloseParen)?;
-                Ok(call)
-            }
-            _ => self.comparison(),
+fn comparison(cursor: &mut Tokens<'_>) -> Result<Expression, ContractError> {
+    let left = operand(cursor)?;
+    let operator = match cursor.take() {
+        Some(Token::Equal) => Operator::Equal,
+        Some(Token::NotEqual) => Operator::NotEqual,
+        Some(Token::Less) => Operator::Less,
+        Some(Token::LessOrEqual) => Operator::LessOrEqual,
+        Some(Token::Greater) => Operator::Greater,
+        Some(Token::GreaterOrEqual) => Operator::GreaterOrEqual,
+        other => return Err(error(format!("expected a comparison, found {other:?}"))),
+    };
+    let right = operand(cursor)?;
+    Ok(Expression::Compare {
+        left,
+        operator,
+        right,
+    })
+}
+
+fn operand(cursor: &mut Tokens<'_>) -> Result<Operand, ContractError> {
+    let literal = match cursor.take() {
+        Some(Token::Path(path)) => return Ok(Operand::Path(path.clone())),
+        Some(Token::Text(text)) => StructuredValue::Text(text.clone()),
+        Some(Token::Integer(integer)) => StructuredValue::Integer(*integer),
+        Some(Token::Decimal(decimal)) => StructuredValue::Decimal(*decimal),
+        Some(Token::Word(word)) if word == "true" => StructuredValue::Bool(true),
+        Some(Token::Word(word)) if word == "false" => StructuredValue::Bool(false),
+        Some(Token::Word(word)) if word == "null" => StructuredValue::Null,
+        other => {
+            return Err(error(format!(
+                "expected a 'path' or a literal, found {other:?}"
+            )));
         }
-    }
+    };
+    Ok(Operand::Literal(literal))
+}
 
-    fn call(&mut self, name: &str) -> Result<Expression, ContractError> {
-        match name {
-            "exists" => Ok(Expression::Exists(self.path()?)),
-            "starts-with" | "contains" => {
-                let path = self.path()?;
-                self.expect(&Token::Comma)?;
-                let text = match self.next() {
-                    Some(Token::Text(text)) => text.clone(),
-                    other => {
-                        return Err(error(format!("{name}() needs a \"text\", found {other:?}")));
-                    }
-                };
-                Ok(if name == "contains" {
-                    Expression::Contains { path, text }
-                } else {
-                    Expression::StartsWith { path, text }
-                })
-            }
-            other => Err(error(format!(
-                "{other}() is not a function a predicate has"
-            ))),
-        }
+fn path(cursor: &mut Tokens<'_>) -> Result<String, ContractError> {
+    match cursor.take() {
+        Some(Token::Path(path)) => Ok(path.clone()),
+        other => Err(error(format!("expected a 'path', found {other:?}"))),
     }
+}
 
-    fn comparison(&mut self) -> Result<Expression, ContractError> {
-        let left = self.operand()?;
-        let operator = match self.next() {
-            Some(Token::Equal) => Operator::Equal,
-            Some(Token::NotEqual) => Operator::NotEqual,
-            Some(Token::Less) => Operator::Less,
-            Some(Token::LessOrEqual) => Operator::LessOrEqual,
-            Some(Token::Greater) => Operator::Greater,
-            Some(Token::GreaterOrEqual) => Operator::GreaterOrEqual,
-            other => return Err(error(format!("expected a comparison, found {other:?}"))),
-        };
-        let right = self.operand()?;
-        Ok(Expression::Compare {
-            left,
-            operator,
-            right,
-        })
-    }
-
-    fn operand(&mut self) -> Result<Operand, ContractError> {
-        let literal = match self.next() {
-            Some(Token::Path(path)) => return Ok(Operand::Path(path.clone())),
-            Some(Token::Text(text)) => StructuredValue::Text(text.clone()),
-            Some(Token::Integer(integer)) => StructuredValue::Integer(*integer),
-            Some(Token::Decimal(decimal)) => StructuredValue::Decimal(*decimal),
-            Some(Token::Word(word)) if word == "true" => StructuredValue::Bool(true),
-            Some(Token::Word(word)) if word == "false" => StructuredValue::Bool(false),
-            Some(Token::Word(word)) if word == "null" => StructuredValue::Null,
-            other => {
-                return Err(error(format!(
-                    "expected a 'path' or a literal, found {other:?}"
-                )));
-            }
-        };
-        Ok(Operand::Literal(literal))
-    }
-
-    fn path(&mut self) -> Result<String, ContractError> {
-        match self.next() {
-            Some(Token::Path(path)) => Ok(path.clone()),
-            other => Err(error(format!("expected a 'path', found {other:?}"))),
-        }
-    }
-
-    fn expect(&mut self, token: &Token) -> Result<(), ContractError> {
-        match self.next() {
-            Some(found) if found == token => Ok(()),
-            other => Err(error(format!("expected {token:?}, found {other:?}"))),
-        }
-    }
-
-    fn word_is(&self, word: &str) -> bool {
-        matches!(self.peek(), Some(Token::Word(found)) if found == word)
-    }
-
-    fn peek(&self) -> Option<&Token> {
-        self.tokens.get(self.at)
-    }
-
-    fn next(&mut self) -> Option<&Token> {
-        let token = self.tokens.get(self.at);
-        self.at += 1;
-        token
-    }
+fn word_is(cursor: &Tokens<'_>, word: &str) -> bool {
+    matches!(cursor.peek(), Some(Token::Word(found)) if found == word)
 }
 
 #[cfg(test)]
@@ -321,7 +300,11 @@ mod tests {
         assert!(Expression::parse("'/a'").is_err());
         assert!(Expression::parse("'/a' = ").is_err());
         assert!(Expression::parse("'/a' = 1 '/b' = 2").is_err());
-        assert!(Expression::parse("('/a' = 1").is_err());
+        let unclosed = Expression::parse("('/a' = 1").expect_err("refused");
+        assert_eq!(
+            unclosed.message,
+            "predicate: expected CloseParen, found None"
+        );
         assert!(Expression::parse("exists(\"/a\")").is_err());
         assert!(Expression::parse("starts-with('/a', '/b')").is_err());
         assert!(Expression::parse("").is_err());
