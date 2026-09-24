@@ -12,7 +12,7 @@
 
 use crate::expression::{Expression, Operand, Operator};
 use crate::lexer::error;
-use contract::{ContractError, StructureReader, StructuredValue};
+use sdk::contract::{ContractError, StructureReader, StructuredValue};
 use std::cmp::Ordering;
 
 /// Evaluate `expression` by reading its paths through `reader`.

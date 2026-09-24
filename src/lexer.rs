@@ -6,7 +6,7 @@
 //! them apart at the lexer means `'/name' = "name"` can never be misread.
 //! Bare words are keywords and function names; the parser sorts them.
 
-use contract::ContractError;
+use sdk::contract::ContractError;
 
 /// One token of a predicate.
 #[derive(Clone, Debug, PartialEq)]
