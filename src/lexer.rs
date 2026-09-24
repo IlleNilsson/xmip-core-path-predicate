@@ -6,6 +6,7 @@
 //! them apart at the lexer means `'/name' = "name"` can never be misread.
 //! Bare words are keywords and function names; the parser sorts them.
 
+use codec::char_reader::CharReader;
 use contract::ContractError;
 
 /// One token of a predicate.
@@ -42,99 +43,100 @@ pub enum Token {
     Comma,
 }
 
-/// Split `predicate` into tokens.
+/// Split `predicate` into tokens. Whitespace is any Unicode whitespace, and
+/// a word may hold any letter.
 ///
 /// # Errors
 /// A character that begins no token, an unterminated string, or a number that
 /// does not parse.
 pub fn tokenize(predicate: &str) -> Result<Vec<Token>, ContractError> {
+    let mut reader = CharReader::new(predicate);
     let mut tokens = Vec::new();
-    let mut rest = predicate;
-    while let Some(first) = rest.chars().next() {
-        let consumed = match first {
-            character if character.is_whitespace() => 1,
-            '(' => push(&mut tokens, Token::OpenParen, 1),
-            ')' => push(&mut tokens, Token::CloseParen, 1),
-            ',' => push(&mut tokens, Token::Comma, 1),
-            '=' => push(&mut tokens, Token::Equal, 1),
-            '!' if rest.starts_with("!=") => push(&mut tokens, Token::NotEqual, 2),
-            '<' if rest.starts_with("<=") => push(&mut tokens, Token::LessOrEqual, 2),
-            '<' => push(&mut tokens, Token::Less, 1),
-            '>' if rest.starts_with(">=") => push(&mut tokens, Token::GreaterOrEqual, 2),
-            '>' => push(&mut tokens, Token::Greater, 1),
-            '\'' | '"' => quoted(rest, first, &mut tokens)?,
-            character if character.is_ascii_digit() => number(rest, &mut tokens)?,
-            '-' if rest[1..].starts_with(|character: char| character.is_ascii_digit()) => {
-                number(rest, &mut tokens)?
+    while let Some(first) = reader.peek() {
+        if reader.skip_whitespace() {
+            continue;
+        }
+        let token = match first {
+            '!' if reader.eat_str("!=") => Token::NotEqual,
+            '<' if reader.eat_str("<=") => Token::LessOrEqual,
+            '>' if reader.eat_str(">=") => Token::GreaterOrEqual,
+            '(' => single(&mut reader, Token::OpenParen),
+            ')' => single(&mut reader, Token::CloseParen),
+            ',' => single(&mut reader, Token::Comma),
+            '=' => single(&mut reader, Token::Equal),
+            '<' => single(&mut reader, Token::Less),
+            '>' => single(&mut reader, Token::Greater),
+            '\'' | '"' => quoted(&mut reader, first)?,
+            character if character.is_ascii_digit() => number(&mut reader)?,
+            '-' if reader.peek_nth(1).is_some_and(|next| next.is_ascii_digit()) => {
+                number(&mut reader)?
             }
-            character if character.is_alphabetic() => word(rest, &mut tokens),
+            character if character.is_alphabetic() => {
+                let word =
+                    reader.take_while(|next| next.is_alphanumeric() || next == '-' || next == '_');
+                Token::Word(word.to_string())
+            }
             other => {
                 return Err(error(format!(
                     "unexpected {other:?} at {} in {predicate:?}",
-                    predicate.len() - rest.len()
+                    reader.offset()
                 )));
             }
         };
-        rest = &rest[consumed..];
+        tokens.push(token);
     }
     Ok(tokens)
 }
 
-fn push(tokens: &mut Vec<Token>, token: Token, width: usize) -> usize {
-    tokens.push(token);
-    width
+fn single(reader: &mut CharReader<'_>, token: Token) -> Token {
+    reader.bump();
+    token
 }
 
 /// A string in `quote`s; a backslash escapes the character after it.
-fn quoted(rest: &str, quote: char, tokens: &mut Vec<Token>) -> Result<usize, ContractError> {
+fn quoted(reader: &mut CharReader<'_>, quote: char) -> Result<Token, ContractError> {
+    let start = reader.offset();
+    reader.bump();
     let mut text = String::new();
-    let mut characters = rest.char_indices().skip(1);
-    while let Some((at, character)) = characters.next() {
+    while let Some(character) = reader.bump() {
         match character {
-            '\\' => match characters.next() {
-                Some((_, escaped)) => text.push(escaped),
+            '\\' => match reader.bump() {
+                Some(escaped) => text.push(escaped),
                 None => break,
             },
             character if character == quote => {
-                tokens.push(if quote == '\'' {
+                return Ok(if quote == '\'' {
                     Token::Path(text)
                 } else {
                     Token::Text(text)
                 });
-                return Ok(at + 1);
             }
             other => text.push(other),
         }
     }
-    Err(error(format!("unterminated string in {rest:?}")))
+    Err(error(format!(
+        "unterminated string in {:?}",
+        reader.since(start)
+    )))
 }
 
-fn number(rest: &str, tokens: &mut Vec<Token>) -> Result<usize, ContractError> {
-    let end = rest[1..]
-        .find(|character: char| !character.is_ascii_digit() && character != '.')
-        .map_or(rest.len(), |offset| offset + 1);
-    let digits = rest[..end].trim_end_matches('.');
-    let token = if digits.contains('.') {
+/// An optional minus, then digits and points; a trailing point is not the
+/// number's.
+fn number(reader: &mut CharReader<'_>) -> Result<Token, ContractError> {
+    let start = reader.offset();
+    reader.eat('-');
+    let run = reader.peek_while(|character| character.is_ascii_digit() || character == '.');
+    reader.eat_str(run.trim_end_matches('.'));
+    let digits = reader.since(start);
+    Ok(if digits.contains('.') {
         Token::Decimal(digits.parse().map_err(|_| not_a_number(digits))?)
     } else {
         Token::Integer(digits.parse().map_err(|_| not_a_number(digits))?)
-    };
-    tokens.push(token);
-    Ok(digits.len())
+    })
 }
 
 fn not_a_number(digits: &str) -> ContractError {
     error(format!("{digits:?} is not a number"))
-}
-
-fn word(rest: &str, tokens: &mut Vec<Token>) -> usize {
-    let end = rest
-        .find(|character: char| {
-            !character.is_alphanumeric() && character != '-' && character != '_'
-        })
-        .unwrap_or(rest.len());
-    tokens.push(Token::Word(rest[..end].to_string()));
-    end
 }
 
 pub(crate) fn error(message: impl std::fmt::Display) -> ContractError {
@@ -203,5 +205,25 @@ mod tests {
         assert!(tokenize("'open = 1").is_err());
         assert!(tokenize("'/a' ! 1").is_err());
         assert!(tokenize("'/a' = 1.2.3").is_err());
+    }
+
+    #[test]
+    fn multibyte_whitespace_and_letters_lex_without_panic() {
+        let tokens =
+            tokenize("'/naïve'\u{a0}=\u{3000}\"Zoë 名前\"\u{2003}and\u{a0}größer").expect("lexes");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Path("/naïve".into()),
+                Token::Equal,
+                Token::Text("Zoë 名前".into()),
+                Token::Word("and".into()),
+                Token::Word("größer".into()),
+            ]
+        );
+        let alone = tokenize("-\u{a0}1").expect_err("a minus alone");
+        assert!(alone.message.contains("'-' at 0"), "{}", alone.message);
+        assert!(tokenize("'/a' = \"öpen\u{a0}").is_err());
+        assert!(tokenize("'/a' = 1\u{a0}€").is_err());
     }
 }
