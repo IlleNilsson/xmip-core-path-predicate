@@ -8,8 +8,8 @@
 //! with `FHIRPath` (ADR-0044); the grammar below is the predicate's.
 
 use crate::lexer::{Token, error, tokenize};
+use contract::{ContractError, StructuredValue};
 use path::cursor::Cursor;
-use sdk::contract::{ContractError, StructuredValue};
 
 /// One side of a comparison.
 #[derive(Clone, Debug, PartialEq)]

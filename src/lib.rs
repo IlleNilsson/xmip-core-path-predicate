@@ -28,8 +28,8 @@ mod lexer;
 
 pub use expression::{Expression, Operand, Operator};
 
+use contract::{ContractError, StructureReader, StructureWriter, StructuredValue};
 use path::{Path, PathCost, PathEngine};
-use sdk::contract::{ContractError, StructureReader, StructureWriter, StructuredValue};
 
 /// The `predicate` engine. It parses the expression and evaluates it through
 /// the reader it is given, one `read` per path operand.
@@ -68,7 +68,7 @@ impl PathEngine for PredicateEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sdk::contract::{ContractDescriptor, ContractId};
+    use contract::{ContractDescriptor, ContractId};
     use std::collections::HashMap;
 
     /// A reader backed by a map of path to value, standing in for any real
